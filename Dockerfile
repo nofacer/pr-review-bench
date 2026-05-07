@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 #
 # Build with docker/ as the only context:
-# docker build -f docker/Dockerfile-inline docker --build-arg CASES_PER_REPO=2 -t benchmark-dataset:2-per-repo-inline
+# docker build -f docker/inline.dockerfile docker --build-arg CASES_PER_REPO=2 -t benchmark-dataset:2-per-repo-inline
 
 FROM python:3.14.4-alpine AS builder
 
@@ -408,14 +408,215 @@ if __name__ == "__main__":
     main()
 PY
 
-FROM alpine:3.22
+RUN python - <<'PY'
+import shutil
+from pathlib import Path
 
-RUN apk add --no-cache ca-certificates git
 
-WORKDIR /dataset
+REPOS_DIR = Path("/dataset/repos")
+
+
+def remove_git_path(path):
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def main():
+    if not REPOS_DIR.exists():
+        print(f"No repos directory found: {REPOS_DIR}")
+        return
+
+    git_paths = sorted(
+        REPOS_DIR.rglob(".git"),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+
+    removed = 0
+    for path in git_paths:
+        if not path.exists() and not path.is_symlink():
+            continue
+        remove_git_path(path)
+        removed += 1
+
+    print(f"Removed {removed} Git metadata path(s) from {REPOS_DIR}")
+
+
+if __name__ == "__main__":
+    main()
+PY
+
+RUN cat > /dataset/output.schema.json <<'JSON'
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentic-review-benchmarks.local/schemas/benchmark-output.schema.json",
+  "title": "AI Code Review Benchmark Runner Output",
+  "description": "JSON object that each runner must write to BENCHMARK_RESULT_FILE.",
+  "type": "object",
+  "required": ["issues"],
+  "properties": {
+    "issues": {
+      "type": "array",
+      "description": "Predicted code review findings for the current benchmark case.",
+      "items": {
+        "type": "object",
+        "required": ["file_path", "start_line", "end_line", "title", "description"],
+        "properties": {
+          "file_path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Path to the affected file, relative to BENCHMARK_REPO_DIR."
+          },
+          "start_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "First affected line in the file."
+          },
+          "end_line": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Last affected line in the file."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Short issue summary."
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Explanation of the defect and why it matters."
+          },
+          "problematic_code_snippet": {
+            "type": "string",
+            "description": "Optional code snippet that demonstrates the issue."
+          },
+          "rule_name": {
+            "type": "string",
+            "description": "Optional rule or best-practice name associated with the issue."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": true
+}
+JSON
+
+RUN cat > /dataset/run_benchmark.sh <<'SH'
+#!/usr/bin/env sh
+set -eu
+
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+
+DATASET_DIR="${DATASET_DIR:-$SCRIPT_DIR}"
+DATASET_JSON="${DATASET_JSON:-$DATASET_DIR/dataset.json}"
+OUTPUT_SCHEMA_FILE="${OUTPUT_SCHEMA_FILE:-$DATASET_DIR/output.schema.json}"
+RUNNER_DIR="${RUNNER_DIR:-/runner}"
+RUNNER_ENTRY="${RUNNER_ENTRY:-$RUNNER_DIR/entry.sh}"
+RESULTS_DIR="${RESULTS_DIR:-/results}"
+WORK_DIR="${WORK_DIR:-/tmp/benchmark}"
+
+fail() {
+  echo "run-benchmark: $*" >&2
+  exit 1
+}
+
+run_entry() {
+  if [ -x "$RUNNER_ENTRY" ]; then
+    "$RUNNER_ENTRY"
+  else
+    bash "$RUNNER_ENTRY"
+  fi
+}
+
+[ -f "$DATASET_JSON" ] || fail "dataset index not found: $DATASET_JSON"
+[ -f "$RUNNER_ENTRY" ] || fail "runner entry not found: $RUNNER_ENTRY. Mount your runner directory to /runner and provide entry.sh."
+command -v jq >/dev/null 2>&1 || fail "jq is required"
+
+mkdir -p "$RESULTS_DIR" "$WORK_DIR/rules"
+
+total="$(jq 'length' "$DATASET_JSON")"
+echo "Dataset : $DATASET_JSON"
+echo "Schema  : $OUTPUT_SCHEMA_FILE"
+echo "Cases   : $total"
+echo "Runner  : $RUNNER_ENTRY"
+echo "Results : $RESULTS_DIR"
+echo
+
+ran=0
+skipped=0
+failed=0
+case_list="$WORK_DIR/cases.txt"
+
+jq -r 'to_entries[].key' "$DATASET_JSON" > "$case_list"
+
+while IFS= read -r case_id; do
+  case_json="$(jq -c --arg id "$case_id" '.[$id]' "$DATASET_JSON")"
+  repo="$(printf '%s' "$case_json" | jq -r '.repo')"
+  pr_number="$(printf '%s' "$case_json" | jq -r '.pr_number')"
+  diff_file="$DATASET_DIR/$(printf '%s' "$case_json" | jq -r '.diff_file')"
+  repo_dir="$DATASET_DIR/$(printf '%s' "$case_json" | jq -r '.repo_dir')"
+  rules_file="$WORK_DIR/rules/${repo}.json"
+  result_file="$RESULTS_DIR/${case_id}.json"
+
+  if [ -s "$result_file" ]; then
+    skipped=$((skipped + 1))
+    printf '[%3d/%3d] SKIP  %s\n' "$((ran + skipped))" "$total" "$case_id"
+    continue
+  fi
+
+  printf '%s' "$case_json" | jq '.rules // []' > "$rules_file"
+  rm -f "$result_file"
+
+  export BENCHMARK_CASE_ID="$case_id"
+  export BENCHMARK_REPO="$repo"
+  export BENCHMARK_PR_NUMBER="$pr_number"
+  export BENCHMARK_DIFF_FILE="$diff_file"
+  export BENCHMARK_REPO_DIR="$repo_dir"
+  export BENCHMARK_RULES_FILE="$rules_file"
+  export BENCHMARK_RESULT_FILE="$result_file"
+  export BENCHMARK_DATASET_DIR="$DATASET_DIR"
+  export BENCHMARK_DATASET_JSON="$DATASET_JSON"
+  export BENCHMARK_OUTPUT_SCHEMA_FILE="$OUTPUT_SCHEMA_FILE"
+
+  ran=$((ran + 1))
+  printf '[%3d/%3d] RUN   %s ... ' "$ran" "$total" "$case_id"
+
+  if run_entry; then
+    if [ -s "$result_file" ]; then
+      echo "ok"
+    else
+      failed=$((failed + 1))
+      echo "failed: runner did not write BENCHMARK_RESULT_FILE"
+    fi
+  else
+    failed=$((failed + 1))
+    echo "failed: runner exited non-zero"
+  fi
+done < "$case_list"
+
+echo
+echo "Summary"
+echo "  Ran    : $ran"
+echo "  Skipped: $skipped"
+echo "  Failed : $failed"
+
+if [ "$failed" -gt 0 ]; then
+  exit 1
+fi
+SH
+
+RUN chmod +x /dataset/run_benchmark.sh
+
+FROM scratch
+
 COPY --from=builder /dataset/ /dataset/
 
 LABEL org.opencontainers.image.title="AI Code Review Benchmark Dataset"
 LABEL org.opencontainers.image.description="Subset of Qodo PR-Review-Bench with the first N cases per repository"
 
-CMD ["sh"]
+CMD ["/bin/true"]
