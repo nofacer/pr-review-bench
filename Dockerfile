@@ -570,6 +570,7 @@ while IFS= read -r case_id; do
   fi
 
   printf '%s' "$case_json" | jq '.rules // []' > "$rules_file"
+  rules_content="$(cat "$rules_file")"
   rm -f "$result_file"
 
   export BENCHMARK_CASE_ID="$case_id"
@@ -578,6 +579,7 @@ while IFS= read -r case_id; do
   export BENCHMARK_DIFF_FILE="$diff_file"
   export BENCHMARK_REPO_DIR="$repo_dir"
   export BENCHMARK_RULES_FILE="$rules_file"
+  export BENCHMARK_RULES_CONTENT="$rules_content"
   export BENCHMARK_RESULT_FILE="$result_file"
   export BENCHMARK_DATASET_DIR="$DATASET_DIR"
   export BENCHMARK_DATASET_JSON="$DATASET_JSON"
@@ -615,6 +617,7 @@ RUN chmod +x /dataset/run_benchmark.sh
 FROM scratch
 
 COPY --from=builder /dataset/ /dataset/
+ADD --chmod=755 scripts/score_with_codex.py /dataset/score_with_codex.py
 
 LABEL org.opencontainers.image.title="AI Code Review Benchmark Dataset"
 LABEL org.opencontainers.image.description="Subset of Qodo PR-Review-Bench with the first N cases per repository"
