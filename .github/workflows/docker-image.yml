@@ -1,0 +1,22 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --build-arg CASES_PER_REPO=2 --tag nofacer/pr-review-bench:2-per-repo
+    - name: Push the Docker image
+      run: |-
+        echo "$DOCKERHUB_PERSONAL_ACCESS_TOKEN" | docker login -u "YOUR_USERNAME" --password-stdin
+        docker push nofacer/pr-review-bench:2-per-repo
